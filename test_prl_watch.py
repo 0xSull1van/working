@@ -62,10 +62,126 @@ class PrlWatchTests(unittest.TestCase):
     def test_save_state_creates_parent_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "nested" / "state.json"
-            state = {"finder_blocks": ["a"], "contributed_blocks": ["b"]}
+            state = {
+                "finder_blocks": ["a"],
+                "contributed_blocks": ["b"],
+                "seen_workers": {"rig01": {"first_seen_ts": 1, "last_online": True, "last_seen_ts": 1}},
+            }
             prl_watch.save_state(state_path, state)
             loaded = prl_watch.load_state(state_path)
             self.assertEqual(loaded, state)
+
+    def test_detect_worker_events_notifies_join_and_offline(self) -> None:
+        state = {"finder_blocks": [], "contributed_blocks": [], "seen_workers": {}}
+        payload = {
+            "workers": [
+                {"name": "rig01", "online": True, "hashrate_live": "500 GH/s"},
+                {"name": "rig02", "online": False, "hashrate_live": "0 H/s"},
+            ],
+            "blocks": [],
+            "estHash1h": "0 H/s",
+            "estHash24h": "0 H/s",
+        }
+        events = prl_watch.detect_worker_events(
+            state, payload, notify_workers=True, notify_offline=True,
+        )
+        self.assertEqual(len(events), 2)
+        self.assertTrue(any("rig01" in event and "joined" in event for event in events))
+        self.assertTrue(any("rig02" in event for event in events))
+        events_again = prl_watch.detect_worker_events(
+            state, payload, notify_workers=True, notify_offline=True,
+        )
+        self.assertEqual(events_again, [])
+
+    def test_detect_worker_events_flips_online_offline(self) -> None:
+        state = {
+            "finder_blocks": [],
+            "contributed_blocks": [],
+            "seen_workers": {
+                "rig01": {"first_seen_ts": 1, "last_online": True, "last_seen_ts": 1},
+            },
+        }
+        payload_offline = {
+            "workers": [{"name": "rig01", "online": False, "hashrate_live": "0 H/s"}],
+            "blocks": [],
+            "estHash1h": "0 H/s",
+            "estHash24h": "0 H/s",
+        }
+        events = prl_watch.detect_worker_events(
+            state, payload_offline, notify_workers=True, notify_offline=True,
+        )
+        self.assertEqual(len(events), 1)
+        self.assertIn("offline", events[0])
+        payload_online = {
+            "workers": [{"name": "rig01", "online": True, "hashrate_live": "500 GH/s"}],
+            "blocks": [],
+            "estHash1h": "0 H/s",
+            "estHash24h": "0 H/s",
+        }
+        events = prl_watch.detect_worker_events(
+            state, payload_online, notify_workers=True, notify_offline=True,
+        )
+        self.assertEqual(len(events), 1)
+        self.assertIn("back online", events[0])
+
+    def test_detect_worker_events_respects_disabled_flags(self) -> None:
+        state = {"finder_blocks": [], "contributed_blocks": [], "seen_workers": {}}
+        payload = {
+            "workers": [{"name": "rig01", "online": True, "hashrate_live": "500 GH/s"}],
+            "blocks": [],
+            "estHash1h": "0 H/s",
+            "estHash24h": "0 H/s",
+        }
+        events = prl_watch.detect_worker_events(
+            state, payload, notify_workers=False, notify_offline=False,
+        )
+        self.assertEqual(events, [])
+        self.assertIn("rig01", state["seen_workers"])
+
+    def test_format_earnings_message_includes_balance_and_estimate(self) -> None:
+        miner_payload = self.sample_payload()
+        pool_stats = {
+            "chain": {"height": 60000, "difficulty": 5000000.0},
+            "coins": [{"reward": 2700.0, "network_hash": "13.91 EH/s"}],
+            "pool": {
+                "hashrate": "1.85 EH/s",
+                "blocks24h": 113,
+                "miners24h": 961,
+                "workers": 11000,
+            },
+            "feePercent": 5.0,
+        }
+        message = prl_watch.format_earnings_message(
+            "prl1ptest",
+            miner_payload,
+            pool_stats=pool_stats,
+            price_usd=0.5,
+            miner_fee_percent=1.0,
+        )
+        self.assertIn("PRL earnings", message)
+        self.assertIn("pending balance", message)
+        self.assertIn("paid out", message)
+        self.assertIn("net PRL/day", message)
+        self.assertIn("net USD/day", message)
+
+    def test_build_telegram_command_response_routes_earnings_and_servers(self) -> None:
+        args = Namespace(
+            address="prl1ptest",
+            worker="rig01",
+            price_usd=0.5,
+            miner_fee_percent=1.0,
+        )
+        pool_stats = {
+            "chain": {"height": 60000, "difficulty": 5000000.0},
+            "coins": [{"reward": 2700.0, "network_hash": "13.91 EH/s"}],
+            "pool": {"hashrate": "1.85 EH/s", "blocks24h": 113, "miners24h": 961, "workers": 11000},
+            "feePercent": 5.0,
+        }
+        with patch("prl_watch.get_miner_stats", return_value=self.sample_payload()),              patch("prl_watch.get_pool_stats", return_value=pool_stats):
+            earnings_reply = prl_watch.build_telegram_command_response(args, "/earnings")
+            servers_reply = prl_watch.build_telegram_command_response(args, "/servers")
+        self.assertIn("PRL earnings", earnings_reply)
+        self.assertIn("PRL servers", servers_reply)
 
     def test_sanitize_command_redacts_password(self) -> None:
         cmd = ["alpha-miner", "--password", "x;d=65536", "--worker", "rig01"]

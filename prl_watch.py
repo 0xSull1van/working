@@ -24,8 +24,10 @@ DEFAULT_POLL_INTERVAL_SECONDS = 30
 DEFAULT_RESTART_DELAY_SECONDS = 15
 DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 30
 DEFAULT_POOL_URL = "stratum+tcp://us2.alphapool.tech:5566"
+DEFAULT_SOLO_POOL_URL = "stratum+tcp://us2.alphapool.tech:5567"
 DEFAULT_DOTENV_FILE = ".env"
 MAX_TRACKED_BLOCKS = 512
+MAX_TRACKED_WORKERS = 2048
 SCRIPT_DIR = Path(__file__).resolve().parent
 MINER_ENV_KEYS_TO_DROP = {
     "PRL_ADDRESS",
@@ -47,6 +49,10 @@ MINER_ENV_KEYS_TO_DROP = {
     "TG_BOT_TOKEN",
     "TG_CHAT_ID",
     "TG_STATUS_INTERVAL_MINUTES",
+    "PRL_NOTIFY_WORKERS",
+    "PRL_NOTIFY_OFFLINE",
+    "PRL_PRICE_USD",
+    "PRL_MINER_FEE_PERCENT",
 }
 DOTENV_KEYS = set(MINER_ENV_KEYS_TO_DROP)
 SAFE_MINER_ENV_KEYS = {
@@ -262,30 +268,31 @@ def block_status(block: dict[str, Any]) -> str:
     return "pending"
 
 
-def load_state(path: Path) -> dict[str, list[str]]:
+def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"finder_blocks": [], "contributed_blocks": []}
+        return {"finder_blocks": [], "contributed_blocks": [], "seen_workers": {}}
 
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"state file unreadable: {path}: {exc}") from exc
 
-    state = {
+    state: dict[str, Any] = {
         "finder_blocks": list(raw.get("finder_blocks", [])),
         "contributed_blocks": list(raw.get("contributed_blocks", [])),
+        "seen_workers": dict(raw.get("seen_workers", {})),
     }
     return state
 
 
-def save_state(path: Path, state: dict[str, list[str]]) -> None:
+def save_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.tmp")
     tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
     tmp_path.replace(path)
 
 
-def remember(state: dict[str, list[str]], bucket: str, value: str) -> bool:
+def remember(state: dict[str, Any], bucket: str, value: str) -> bool:
     items = state.setdefault(bucket, [])
     if value in items:
         return False
@@ -629,17 +636,94 @@ def format_devices_message(gpus: list[dict[str, Any]], header: str = "Local devi
     return "\n".join(lines)
 
 
+def format_worker_event_message(
+    title: str,
+    name: str,
+    worker: dict[str, Any],
+    payload: dict[str, Any],
+    is_first: bool,
+) -> str:
+    metrics = derive_address_metrics(payload)
+    lines = [title]
+    rows: list[tuple[str, str]] = [
+        ("worker", name),
+        ("status", "online" if worker.get("online") else "offline"),
+        ("live", str(worker.get("hashrate_live", "0 H/s"))),
+        ("1h", str(worker.get("hashrate_1h", worker.get("hashrate1h", "0 H/s")))),
+        ("difficulty", fmt_difficulty(worker.get("difficulty"))),
+        ("last share", parse_unix_timestamp(worker.get("time"))),
+    ]
+    if is_first:
+        rows.append(("note", "first time seen on this address"))
+    append_pair_section(lines, "Worker", rows)
+    append_pair_section(
+        lines,
+        "Address state",
+        [
+            ("workers online", fmt_count(metrics["workers_online"])),
+            ("live hashrate", metrics["live_hashrate_text"]),
+        ],
+    )
+    return "\n".join(lines)
+
+
+def format_earnings_message(
+    address: str,
+    miner_payload: dict[str, Any],
+    pool_stats: dict[str, Any] | None = None,
+    price_usd: float | None = None,
+    miner_fee_percent: float = 1.0,
+) -> str:
+    metrics = derive_address_metrics(miner_payload)
+    live_hps = sum(
+        parsed
+        for worker in miner_payload.get("workers", [])
+        if (parsed := try_parse_hashrate_to_hps(worker.get("hashrate_live"))) is not None
+    )
+    lines = ["PRL earnings"]
+    rows: list[tuple[str, str]] = [
+        ("address", address),
+        ("pending balance", fmt_prl(metrics["balance_prl"])),
+        ("paid out", fmt_prl(metrics["paid_prl"])),
+        ("total earned", fmt_prl(metrics["total_earned_prl"])),
+    ]
+    if price_usd and price_usd > 0:
+        rows.append(("total earned USD", fmt_usd(metrics["total_earned_prl"] * price_usd)))
+    append_pair_section(lines, "Balance", rows)
+
+    if pool_stats and live_hps > 0:
+        try:
+            pool_metrics = derive_live_metrics(pool_stats)
+            total_fee = (pool_metrics["pool_fee_percent"] + miner_fee_percent) / 100.0
+            daily_prl_gross = (live_hps / 1e12) * pool_metrics["prl_per_day_per_th"]
+            daily_prl_net = daily_prl_gross * (1.0 - total_fee)
+            estimate_rows: list[tuple[str, str]] = [
+                ("live hashrate", metrics["live_hashrate_text"]),
+                ("gross PRL/day", f"{daily_prl_gross:.4f} PRL"),
+                ("net PRL/day", f"{daily_prl_net:.4f} PRL"),
+                ("pool+miner fees", fmt_pct(total_fee)),
+            ]
+            if price_usd and price_usd > 0:
+                estimate_rows.append(("net USD/day", fmt_usd(daily_prl_net * price_usd)))
+            append_pair_section(lines, "Live estimate", estimate_rows)
+        except (KeyError, ValueError, ZeroDivisionError) as exc:
+            append_text_section(lines, "Live estimate", [f"unavailable: {exc}"])
+    return "\n".join(lines)
+
+
 def format_help_message() -> str:
     lines = ["PRL bot commands"]
     append_text_section(
         lines,
         "Available commands",
         [
-            "/status   overall address summary",
-            "/workers  pool workers and hashrate per worker",
-            "/blocks   recent blocks, rewards, balances",
-            "/devices  local GPU telemetry on the host running the bot",
-            "/help     command reference",
+            "/status    overall address summary",
+            "/servers   per-server hashrate breakdown (alias of /workers)",
+            "/workers   pool workers and hashrate per worker",
+            "/earnings  pending balance, paid out, live PRL/day estimate",
+            "/blocks    recent blocks, rewards, balances",
+            "/devices   local GPU telemetry on the host running the bot",
+            "/help      command reference",
         ],
     )
     return "\n".join(lines)
@@ -892,7 +976,7 @@ def safe_notify(args: argparse.Namespace, message: str) -> None:
 
 
 def seed_seen_blocks(
-    state: dict[str, list[str]],
+    state: dict[str, Any],
     payload: dict[str, Any],
     notify_contributed: bool,
 ) -> None:
@@ -904,6 +988,70 @@ def seed_seen_blocks(
             remember(state, "finder_blocks", block_hash)
         if notify_contributed:
             remember(state, "contributed_blocks", block_hash)
+
+
+def seed_seen_workers(state: dict[str, Any], payload: dict[str, Any]) -> None:
+    seen = state.setdefault("seen_workers", {})
+    now_ts = int(time.time())
+    for worker in payload.get("workers", []):
+        name = get_worker_name(worker)
+        if not name or name in seen:
+            continue
+        seen[name] = {
+            "first_seen_ts": now_ts,
+            "last_online": bool(worker.get("online")),
+            "last_seen_ts": now_ts,
+        }
+    _prune_seen_workers(seen)
+
+
+def _prune_seen_workers(seen: dict[str, Any]) -> None:
+    if len(seen) <= MAX_TRACKED_WORKERS:
+        return
+    sorted_items = sorted(seen.items(), key=lambda item: item[1].get("last_seen_ts", 0))
+    for name, _info in sorted_items[: len(sorted_items) - MAX_TRACKED_WORKERS]:
+        del seen[name]
+
+
+def detect_worker_events(
+    state: dict[str, Any],
+    payload: dict[str, Any],
+    notify_workers: bool,
+    notify_offline: bool,
+) -> list[str]:
+    seen = state.setdefault("seen_workers", {})
+    events: list[str] = []
+    now_ts = int(time.time())
+    for worker in payload.get("workers", []):
+        name = get_worker_name(worker)
+        if not name:
+            continue
+        is_online = bool(worker.get("online"))
+        prev = seen.get(name)
+        if prev is None:
+            seen[name] = {
+                "first_seen_ts": now_ts,
+                "last_online": is_online,
+                "last_seen_ts": now_ts,
+            }
+            if notify_workers:
+                events.append(format_worker_event_message(
+                    "PRL worker joined", name, worker, payload, is_first=True,
+                ))
+            continue
+        prev["last_seen_ts"] = now_ts
+        if prev.get("last_online") != is_online:
+            if is_online and notify_workers:
+                events.append(format_worker_event_message(
+                    "PRL worker back online", name, worker, payload, is_first=False,
+                ))
+            elif (not is_online) and notify_offline:
+                events.append(format_worker_event_message(
+                    "PRL worker offline", name, worker, payload, is_first=False,
+                ))
+            prev["last_online"] = is_online
+    _prune_seen_workers(seen)
+    return events
 
 
 def format_block_message(
@@ -1034,6 +1182,25 @@ def build_telegram_command_response(args: argparse.Namespace, text: str) -> str:
     if command == "/blocks":
         payload = get_miner_stats(args.address)
         return format_blocks_message(args.address, payload, header="PRL blocks")
+    if command in {"/servers", "/rigs"}:
+        payload = get_miner_stats(args.address)
+        return format_workers_message(args.address, payload, header="PRL servers", local_workers=local_workers)
+    if command in {"/earnings", "/profit", "/balance"}:
+        payload = get_miner_stats(args.address)
+        pool_stats = None
+        try:
+            pool_stats = get_pool_stats()
+        except Exception:
+            pool_stats = None
+        price = getattr(args, "price_usd", None)
+        miner_fee = getattr(args, "miner_fee_percent", 1.0)
+        return format_earnings_message(
+            args.address,
+            payload,
+            pool_stats=pool_stats,
+            price_usd=price,
+            miner_fee_percent=miner_fee,
+        )
     return format_help_message()
 
 
@@ -1096,6 +1263,10 @@ def build_bot_process_env(args: argparse.Namespace) -> dict[str, str]:
     child_env["TG_CHAT_ID"] = args.telegram_chat_id
     if getattr(args, "worker", None):
         child_env["PRL_WORKER"] = args.worker
+    if getattr(args, "price_usd", None) is not None:
+        child_env["PRL_PRICE_USD"] = str(args.price_usd)
+    if getattr(args, "miner_fee_percent", None) is not None:
+        child_env["PRL_MINER_FEE_PERCENT"] = str(args.miner_fee_percent)
     return child_env
 
 
@@ -1110,6 +1281,7 @@ def poll_and_notify(
 
     if not seeded:
         seed_seen_blocks(state, payload, args.notify_contributed)
+        seed_seen_workers(state, payload)
         save_state(state_path, state)
         return True, payload
 
@@ -1150,6 +1322,16 @@ def poll_and_notify(
             )
             remember(state, "contributed_blocks", block_hash)
             changed = True
+
+    worker_events = detect_worker_events(
+        state,
+        payload,
+        notify_workers=getattr(args, "notify_workers", True),
+        notify_offline=getattr(args, "notify_offline", True),
+    )
+    for event in worker_events:
+        notify_if_configured(args, event)
+        changed = True
 
     if changed:
         save_state(state_path, state)
@@ -1378,6 +1560,37 @@ def run_miner(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_hub(args: argparse.Namespace) -> int:
+    bot_cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "bot",
+        "--telegram-poll-timeout",
+        str(args.telegram_poll_timeout),
+    ]
+    print("bot command:")
+    print(" ".join(bot_cmd))
+
+    try:
+        bot_process = subprocess.Popen(
+            bot_cmd,
+            env=build_bot_process_env(args),
+        )
+    except OSError as exc:
+        print(f"bot start failed: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        return run_monitor(args)
+    finally:
+        if bot_process.poll() is None:
+            bot_process.terminate()
+            try:
+                bot_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                bot_process.kill()
+
+
 def run_serve(args: argparse.Namespace) -> int:
     bot_cmd = [
         sys.executable,
@@ -1443,6 +1656,30 @@ def add_common_monitor_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="send periodic Telegram status every N minutes, 0 disables it",
+    )
+    parser.add_argument(
+        "--notify-workers",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Telegram alerts on new/returning workers (default on)",
+    )
+    parser.add_argument(
+        "--notify-offline",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Telegram alerts when a worker drops offline (default on)",
+    )
+    parser.add_argument(
+        "--price-usd",
+        type=float,
+        default=None,
+        help="PRL/USD price for /earnings estimate; env PRL_PRICE_USD",
+    )
+    parser.add_argument(
+        "--miner-fee-percent",
+        type=float,
+        default=None,
+        help="miner client fee percent for /earnings estimate, default 1 for alpha-miner",
     )
 
 
@@ -1553,6 +1790,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Telegram getUpdates timeout, default {DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS}",
     )
 
+    hub_parser = sub.add_parser(
+        "hub",
+        help="run central control: address monitor + Telegram bot, no mining",
+    )
+    add_common_monitor_args(hub_parser)
+    hub_parser.add_argument(
+        "--worker",
+        help="optional local worker name to highlight in status responses",
+    )
+    hub_parser.add_argument(
+        "--telegram-poll-timeout",
+        type=int,
+        default=DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS,
+        help=f"Telegram getUpdates timeout, default {DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS}",
+    )
+
     serve_parser = sub.add_parser("serve", help="run miner and Telegram bot command loop together")
     add_common_monitor_args(serve_parser)
     add_run_args(serve_parser)
@@ -1592,6 +1845,19 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         args.telegram_status_interval_minutes = (
             0 if args.telegram_status_interval_minutes is None else int(args.telegram_status_interval_minutes)
         )
+    if hasattr(args, "notify_workers"):
+        if args.notify_workers is None:
+            args.notify_workers = parse_bool(os.environ.get("PRL_NOTIFY_WORKERS", "true"))
+    if hasattr(args, "notify_offline"):
+        if args.notify_offline is None:
+            args.notify_offline = parse_bool(os.environ.get("PRL_NOTIFY_OFFLINE", "true"))
+    if hasattr(args, "price_usd"):
+        args.price_usd = env_or(args.price_usd, "PRL_PRICE_USD")
+        if args.price_usd is not None:
+            args.price_usd = float(args.price_usd)
+    if hasattr(args, "miner_fee_percent"):
+        if args.miner_fee_percent is None:
+            args.miner_fee_percent = float(os.environ.get("PRL_MINER_FEE_PERCENT", "1.0"))
     if hasattr(args, "miner_binary"):
         args.miner_binary = env_or(args.miner_binary, "PRL_MINER_BINARY")
         if args.miner_binary:
@@ -1706,6 +1972,10 @@ def main() -> int:
     if args.command == "bot":
         validate_bot_args(args)
         return run_bot(args)
+
+    if args.command == "hub":
+        validate_bot_args(args)
+        return run_hub(args)
 
     if args.command == "serve":
         validate_bot_args(args)
